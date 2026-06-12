@@ -28,6 +28,7 @@ from .mamba import Mamba
 from .mamba2 import Mamba2
 from .mamba3 import Mamba3
 from .mesa_net import MesaNet
+from .mesa_net_diy import MesaNetDIY
 from .mla import MultiheadLatentAttention
 from .moba import MoBA
 from .mom import MomAttention
@@ -69,6 +70,7 @@ __all__ = [
     'Mamba2',
     'Mamba3',
     'MesaNet',
+    "MesaNetDIY",
     'MoBA',
     'MomAttention',
     'MultiScaleRetention',
