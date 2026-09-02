@@ -7,6 +7,7 @@
 
 from .abc import ABCAttention
 from .attn import Attention
+from .attn_swa_sink import AttentionSWASink
 from .based import BasedLinearAttention
 from .bitattn import BitAttention
 from .comba import Comba
@@ -49,6 +50,7 @@ from .yoco import YOCOCrossAttention, YOCOGatedRetention, YOCOSharedKVBuilder
 __all__ = [
     'ABCAttention',
     'Attention',
+    'AttentionSWASink',
     'BasedLinearAttention',
     'BitAttention',
     'Comba',
