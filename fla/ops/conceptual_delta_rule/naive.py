@@ -16,6 +16,7 @@ def naive_recurrent_conceptual_delta_rule(
     v: torch.Tensor,
     beta: torch.Tensor,
     g: torch.Tensor,
+    eta: float = 1.0,
     scale: float = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
@@ -53,6 +54,8 @@ def naive_recurrent_conceptual_delta_rule(
         b_v = v[:, :, i].clone()
         h = h.clone() * g[:, :, i].exp()[..., None, None]
         b_beta = beta[:, :, i]
+        b_a = eta * b_beta
+        b_beta = b_a / (1 + b_a * b_k.square().sum(-1))
         b_v = b_v - (h.clone() * b_k[..., None]).sum(-2)
         b_v = b_v * b_beta[..., None]
         h = h.clone() + b_k.unsqueeze(-1) * b_v.unsqueeze(-2)
@@ -70,6 +73,7 @@ def naive_chunk_conceptual_delta_rule(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
+    eta: float = 1.0,
     chunk_size: int = 64,
     scale: float = None,
     initial_state: torch.Tensor = None,
@@ -114,6 +118,8 @@ def naive_chunk_conceptual_delta_rule(
     b, h, l, d_k = q.shape
     d_v = v.shape[-1]
     q = q * scale
+    a = eta * beta
+    beta = a / (1 + a * k.square().sum(-1))
     v = v * beta[..., None]
     k_beta = k * beta[..., None]
     assert l % chunk_size == 0

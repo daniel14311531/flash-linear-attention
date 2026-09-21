@@ -42,6 +42,7 @@ def fused_recurrent_conceptual_delta_rule_fwd_kernel(
     ht,
     cu_seqlens,
     scale,
+    eta,
     T,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -128,6 +129,16 @@ def fused_recurrent_conceptual_delta_rule_fwd_kernel(
             if ALLOW_NEG_EIGVAL:
                 b_beta = b_beta * 2
 
+        b_a = eta * b_beta
+        b_norm2 = tl.sum(b_k * b_k)
+        b_x = b_a * b_norm2
+        b_denom = tl.fma(b_a, b_norm2, 1.0)
+        b_beta_direct = b_a / b_denom
+        b_a_safe = tl.where(b_a > 0.0, b_a, 1.0)
+        b_beta_recip = 1.0 / (b_norm2 + 1.0 / b_a_safe)
+        b_beta = tl.where(b_x <= 1.0, b_beta_direct, b_beta_recip)
+        b_beta = tl.where(b_a == 0.0, 0.0, b_beta)
+
         if USE_G:
             b_g = tl.load(p_g).to(tl.float32)
             if USE_GATE_IN_KERNEL:
@@ -189,6 +200,7 @@ def fused_recurrent_conceptual_delta_rule_fwd(
     gk: torch.Tensor | None = None,
     gv: torch.Tensor | None = None,
     beta: torch.Tensor | None = None,
+    eta: float = 1.0,
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     scale: float = None,
@@ -233,6 +245,7 @@ def fused_recurrent_conceptual_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         scale=scale,
         T=T,
+        eta=eta,
         H=H,
         HV=HV,
         K=K,
@@ -263,6 +276,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         gk: torch.Tensor | None = None,
         gv: torch.Tensor | None = None,
         beta: torch.Tensor | None = None,
+        eta: float = 1.0,
         A_log: torch.Tensor | None = None,
         dt_bias: torch.Tensor | None = None,
         scale: float = None,
@@ -281,6 +295,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             g=g,
             gk=gk,
             gv=gv,
+            eta=eta,
             beta=beta,
             A_log=A_log,
             dt_bias=dt_bias,
@@ -314,6 +329,7 @@ def fused_recurrent_conceptual_delta_rule(
     gk: torch.Tensor | None = None,
     gv: torch.Tensor | None = None,
     beta: torch.Tensor | None = None,
+    eta: float = 1.0,
     scale: float = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
@@ -328,6 +344,10 @@ def fused_recurrent_conceptual_delta_rule(
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
+    Apply the recurrent Conceptual Delta Rule with
+    `a = eta * beta` and effective update weight
+    `a / (1 + a * ||k||^2)`.
+
     Args:
         q (torch.Tensor):
             queries of shape `[B, T, H, K]`.
@@ -346,7 +366,9 @@ def fused_recurrent_conceptual_delta_rule(
         gv (torch.Tensor):
             gv (decays) of shape `[B, T, HV, V]`. Default: `None`.
         beta (torch.Tensor):
-            betas of shape `[B, T, HV]`.
+            Nonnegative update weights of shape `[B, T, HV]`, with `eta * beta <= 100`.
+        eta (float, Optional):
+            Step-size multiplier applied to `beta`. It must be in `[0.1, 100]`. Default: `1.0`.
         scale (Optional[float]):
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
@@ -373,9 +395,7 @@ def fused_recurrent_conceptual_delta_rule(
             - If `False`, `beta` is expected to already be in post-sigmoid space.
             Default: `False`.
         allow_neg_eigval (Optional[bool]):
-            Whether to allow negative eigenvalues by scaling `beta` to `[0, 2)`.
-            Only takes effect together with `use_beta_sigmoid_in_kernel=True`, in which case
-            the kernel computes `2 * sigmoid(beta)` instead of `sigmoid(beta)`. Default: `False`.
+            Reserved for API compatibility. `True` is not supported. Default: `False`.
         state_v_first (Optional[bool]):
             Store the recurrent state in V-first ``[V, K]`` layout instead of the default ``[K, V]``. Default: ``False``.
         cu_seqlens (torch.LongTensor):
@@ -441,7 +461,7 @@ def fused_recurrent_conceptual_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if beta is None:
-        beta = torch.ones_like(q[..., 0])
+        beta = torch.ones_like(v[..., 0])
     if use_gate_in_kernel:
         if A_log is None:
             raise ValueError("`A_log` must be provided when `use_gate_in_kernel=True`.")
@@ -450,8 +470,14 @@ def fused_recurrent_conceptual_delta_rule(
     else:
         A_log = None
         dt_bias = None
-    if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
-        raise ValueError("`allow_neg_eigval=True` requires `use_beta_sigmoid_in_kernel=True`.")
+    if allow_neg_eigval:
+        raise ValueError("`allow_neg_eigval=True` is not supported by Conceptual Delta Rule.")
+    if not 0.1 <= eta <= 100:
+        raise ValueError(f"`eta` must be in `[0.1, 100]`, got {eta}.")
+    if not use_beta_sigmoid_in_kernel and torch.any(beta < 0):
+        raise ValueError("`beta` must be nonnegative when `use_beta_sigmoid_in_kernel=False`.")
+    if not use_beta_sigmoid_in_kernel and torch.any(eta * beta > 100):
+        raise ValueError("`eta * beta` must not exceed 100.")
 
     o, final_state = FusedRecurrentFunction.apply(
         q,
@@ -461,6 +487,7 @@ def fused_recurrent_conceptual_delta_rule(
         gk,
         gv,
         beta,
+        eta,
         A_log,
         dt_bias,
         scale,

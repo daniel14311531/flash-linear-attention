@@ -10,18 +10,22 @@ import warnings
 import torch
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
-from fla.ops.common.chunk_delta_h import chunk_conceptual_delta_rule_bwd_dhu, chunk_conceptual_delta_rule_fwd_h
+from fla.ops.common.chunk_delta_h import (
+    chunk_gated_delta_rule_bwd_dhu as chunk_conceptual_delta_rule_bwd_dhu,
+    chunk_gated_delta_rule_fwd_h as chunk_conceptual_delta_rule_fwd_h,
+)
 from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from fla.ops.common.gate import fused_beta_sigmoid, fused_beta_sigmoid_bwd
 from fla.ops.cp import FLACPContext
 from fla.ops.cp.chunk_delta_h import (
-    chunk_conceptual_delta_rule_bwd_dhu_pre_process,
-    chunk_conceptual_delta_rule_fwd_h_pre_process,
+    chunk_gated_delta_rule_bwd_dhu_pre_process as chunk_conceptual_delta_rule_bwd_dhu_pre_process,
+    chunk_gated_delta_rule_fwd_h_pre_process as chunk_conceptual_delta_rule_fwd_h_pre_process,
     compress_h0,
     expand_h0,
 )
 from fla.ops.conceptual_delta_rule.chunk_fwd import chunk_conceptual_delta_rule_fwd_intra
 from fla.ops.conceptual_delta_rule.gate import cdn_gate_bwd, cdn_gate_chunk_cumsum
+from fla.ops.conceptual_delta_rule.precondition import effective_beta_bwd, effective_beta_fwd
 from fla.ops.conceptual_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
@@ -249,7 +253,7 @@ def chunk_conceptual_delta_rule_bwd(
     return dq, dk, dv, db, dg, dh0, dA_log, ddt_bias
 
 
-class ChunkconceptualDeltaRuleFunction(torch.autograd.Function):
+class ChunkConceptualDeltaRuleFunction(torch.autograd.Function):
 
     @staticmethod
     @input_guard
@@ -261,6 +265,7 @@ class ChunkconceptualDeltaRuleFunction(torch.autograd.Function):
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
+        eta: float,
         scale: float,
         initial_state: torch.Tensor,
         output_final_state: bool,
@@ -286,6 +291,8 @@ class ChunkconceptualDeltaRuleFunction(torch.autograd.Function):
         if use_beta_sigmoid_in_kernel:
             beta = fused_beta_sigmoid(beta_raw, scale=2.0 if allow_neg_eigval else 1.0)
 
+        effective_beta, inv_denom = effective_beta_fwd(k=k, beta=beta, eta=eta)
+
         if chunk_indices is None and cu_seqlens is not None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu)
         g, o, A, final_state, initial_state, g_input = chunk_conceptual_delta_rule_fwd(
@@ -293,7 +300,7 @@ class ChunkconceptualDeltaRuleFunction(torch.autograd.Function):
             k=k,
             v=v,
             g=g,
-            beta=beta,
+            beta=effective_beta,
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
@@ -315,6 +322,8 @@ class ChunkconceptualDeltaRuleFunction(torch.autograd.Function):
             g,
             beta_raw,
             beta,
+            effective_beta,
+            inv_denom,
             A,
             initial_state,
             cu_seqlens,
@@ -324,6 +333,7 @@ class ChunkconceptualDeltaRuleFunction(torch.autograd.Function):
             dt_bias,
         )
         ctx.scale = scale
+        ctx.eta = eta
         ctx.chunk_size = chunk_size
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.use_beta_sigmoid_in_kernel = use_beta_sigmoid_in_kernel
@@ -350,6 +360,8 @@ class ChunkconceptualDeltaRuleFunction(torch.autograd.Function):
             g,
             beta_raw,
             beta,
+            effective_beta,
+            inv_denom,
             A,
             initial_state,
             cu_seqlens,
@@ -363,7 +375,7 @@ class ChunkconceptualDeltaRuleFunction(torch.autograd.Function):
             k=k,
             v=v,
             g=g,
-            beta=beta,
+            beta=effective_beta,
             A=A,
             scale=ctx.scale,
             initial_state=initial_state,
@@ -379,6 +391,14 @@ class ChunkconceptualDeltaRuleFunction(torch.autograd.Function):
             dt_bias=dt_bias,
             chunk_size=ctx.chunk_size,
         )
+        dk_beta, db = effective_beta_bwd(
+            k=k,
+            effective_beta=effective_beta,
+            inv_denom=inv_denom,
+            deffective_beta=db,
+            eta=ctx.eta,
+        )
+        dk.add_(dk_beta)
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
@@ -386,7 +406,7 @@ class ChunkconceptualDeltaRuleFunction(torch.autograd.Function):
             db = fused_beta_sigmoid_bwd(beta_raw, db, scale=2.0 if ctx.allow_neg_eigval else 1.0)
         return (
             dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta_raw),
-            None, dh0, None, None, None, None, None, None, None, dA_log, ddt_bias,
+            None, None, dh0, None, None, None, None, None, None, None, dA_log, ddt_bias,
             None, None, None, None,
         )
 
@@ -398,6 +418,7 @@ def chunk_conceptual_delta_rule(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
+    eta: float = 1.0,
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
@@ -412,6 +433,10 @@ def chunk_conceptual_delta_rule(
     **kwargs,
 ):
     r"""
+    Apply the chunkwise Conceptual Delta Rule with
+    `a = eta * beta` and effective update weight
+    `a / (1 + a * ||k||^2)`.
+
     Args:
         q (torch.Tensor):
             queries of shape `[B, T, H, K]`.
@@ -426,7 +451,9 @@ def chunk_conceptual_delta_rule(
             When `use_gate_in_kernel=True`, `g` is the raw input before gate activation;
             the kernel fuses `-exp(A_log) * softplus(g + dt_bias)` + chunk cumsum internally.
         beta (torch.Tensor):
-            betas of shape `[B, T, HV]`.
+            Nonnegative update weights of shape `[B, T, HV]`, with `eta * beta <= 100`.
+        eta (float, Optional):
+            Step-size multiplier applied to `beta`. It must be in `[0.1, 100]`. Default: `1.0`.
         scale (Optional[float]):
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
@@ -454,9 +481,7 @@ def chunk_conceptual_delta_rule(
             - If `False`, `beta` is expected to already be in post-sigmoid space.
             Default: `False`.
         allow_neg_eigval (bool):
-            Whether to allow negative eigenvalues by scaling `beta` to `[0, 2)`.
-            Only takes effect together with `use_beta_sigmoid_in_kernel=True`, in which case
-            the kernel computes `2 * sigmoid(beta)` instead of `sigmoid(beta)`. Default: `False`.
+            Reserved for API compatibility. `True` is not supported. Default: `False`.
         state_v_first (Optional[bool]):
             Store the recurrent state in V-first ``[V, K]`` layout instead of the default ``[K, V]``. Default: ``False``.
         cu_seqlens (torch.LongTensor):
@@ -561,17 +586,24 @@ def chunk_conceptual_delta_rule(
     dt_bias = kwargs.get('dt_bias')
     if use_gate_in_kernel:
         assert A_log is not None, "A_log must be provided when use_gate_in_kernel=True."
-    if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
-        raise ValueError("`allow_neg_eigval=True` requires `use_beta_sigmoid_in_kernel=True`.")
+    if allow_neg_eigval:
+        raise ValueError("`allow_neg_eigval=True` is not supported by Conceptual Delta Rule.")
+    if not 0.1 <= eta <= 100:
+        raise ValueError(f"`eta` must be in `[0.1, 100]`, got {eta}.")
+    if not use_beta_sigmoid_in_kernel and torch.any(beta < 0):
+        raise ValueError("`beta` must be nonnegative when `use_beta_sigmoid_in_kernel=False`.")
+    if not use_beta_sigmoid_in_kernel and torch.any(eta * beta > 100):
+        raise ValueError("`eta * beta` must not exceed 100.")
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, final_state = ChunkconceptualDeltaRuleFunction.apply(
+    o, final_state = ChunkConceptualDeltaRuleFunction.apply(
         q,
         k,
         v,
         g,
         beta,
+        eta,
         scale,
         initial_state,
         output_final_state,
