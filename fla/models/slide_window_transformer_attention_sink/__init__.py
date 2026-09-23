@@ -5,13 +5,11 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-# For a list of all contributors, visit
-#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
-
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
-from fla.models.slide_window_transformer_attention_sink.configuration_slide_window_transformer_attention_sink import \
-    SlideWindowTransformerAttentionSinkConfig
+from fla.models.slide_window_transformer_attention_sink.configuration_slide_window_transformer_attention_sink import (
+    SlideWindowTransformerAttentionSinkConfig,
+)
 from fla.models.slide_window_transformer_attention_sink.modeling_slide_window_transformer_attention_sink import (
     SlideWindowTransformerAttentionSinkForCausalLM,
     SlideWindowTransformerAttentionSinkModel,

@@ -45,8 +45,8 @@ from .wall_attn import parallel_wall_attn, parallel_wall_attn_decode
 
 __all__ = [
     'chunk_abc',
-    'chunk_comba',
     'chunk_cdn',
+    'chunk_comba',
     'chunk_delta_rule',
     'chunk_dplr_delta_rule',
     'chunk_gated_delta_rule',

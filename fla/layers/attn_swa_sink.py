@@ -5,12 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-# For a list of all contributors, visit
-#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
-
 from __future__ import annotations
 
-import typing
 from typing import TYPE_CHECKING
 
 import torch

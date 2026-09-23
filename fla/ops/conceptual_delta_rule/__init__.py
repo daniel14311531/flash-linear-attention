@@ -5,13 +5,15 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-from .chunk import chunk_conceptual_delta_rule, chunk_cdn
-from .fused_recurrent import fused_recurrent_conceptual_delta_rule, fused_recurrent_cdn
+from .chunk import chunk_cdn, chunk_conceptual_delta_rule
+from .fused_recurrent import fused_recurrent_cdn, fused_recurrent_conceptual_delta_rule
 from .naive import naive_chunk_conceptual_delta_rule, naive_recurrent_conceptual_delta_rule
 
 __all__ = [
-    "chunk_conceptual_delta_rule", "chunk_cdn",
-    "fused_recurrent_conceptual_delta_rule", "fused_recurrent_cdn",
+    "chunk_cdn",
+    "chunk_conceptual_delta_rule",
+    "fused_recurrent_cdn",
+    "fused_recurrent_conceptual_delta_rule",
     "naive_chunk_conceptual_delta_rule",
     "naive_recurrent_conceptual_delta_rule",
 ]

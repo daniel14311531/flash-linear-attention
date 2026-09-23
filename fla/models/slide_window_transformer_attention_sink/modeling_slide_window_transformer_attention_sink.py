@@ -5,14 +5,11 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-# For a list of all contributors, visit
-#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
-
 from __future__ import annotations
 
 import math
-import warnings
 import typing
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -23,8 +20,9 @@ from transformers.utils import logging
 from transformers.utils.deprecation import deprecate_kwarg
 
 from fla.layers.attn_swa_sink import AttentionSWASink
-from fla.models.slide_window_transformer_attention_sink.configuration_slide_window_transformer_attention_sink import \
-    SlideWindowTransformerAttentionSinkConfig
+from fla.models.slide_window_transformer_attention_sink.configuration_slide_window_transformer_attention_sink import (
+    SlideWindowTransformerAttentionSinkConfig,
+)
 from fla.models.utils import Cache, FLAGenerationMixin
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, RMSNorm
 from fla.modules import GatedMLP as TransformerMLP
