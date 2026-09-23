@@ -7,6 +7,7 @@
 
 from .abc import ABCAttention
 from .attn import Attention
+from .attn_swa_sink import AttentionSWASink
 from .based import BasedLinearAttention
 from .bitattn import BitAttention
 from .comba import Comba
@@ -28,6 +29,7 @@ from .mamba import Mamba
 from .mamba2 import Mamba2
 from .mamba3 import Mamba3
 from .mesa_net import MesaNet
+from .mesa_net_diy import MesaNetDIY
 from .mla import MultiheadLatentAttention
 from .moba import MoBA
 from .mom import MomAttention
@@ -49,6 +51,7 @@ from .yoco import YOCOCrossAttention, YOCOGatedRetention, YOCOSharedKVBuilder
 __all__ = [
     'ABCAttention',
     'Attention',
+    'AttentionSWASink',
     'BasedLinearAttention',
     'BitAttention',
     'Comba',
@@ -70,6 +73,7 @@ __all__ = [
     'Mamba2',
     'Mamba3',
     'MesaNet',
+    "MesaNetDIY",
     'MoBA',
     'MomAttention',
     'MomentumDeltaNet',

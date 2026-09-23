@@ -30,6 +30,7 @@ from fla.models.mamba import MambaConfig, MambaForCausalLM, MambaModel
 from fla.models.mamba2 import Mamba2Config, Mamba2ForCausalLM, Mamba2Model
 from fla.models.mamba3 import Mamba3Config, Mamba3ForCausalLM, Mamba3Model
 from fla.models.mesa_net import MesaNetConfig, MesaNetForCausalLM, MesaNetModel
+from fla.models.mesa_net_diy import MesaNetDIYConfig, MesaNetDIYForCausalLM, MesaNetDIYModel
 from fla.models.mla import MLAConfig, MLAForCausalLM, MLAModel
 from fla.models.moba import MoBAConfig, MoBAForCausalLM, MoBAModel
 from fla.models.mom import MomConfig, MomForCausalLM, MomModel
@@ -52,6 +53,11 @@ from fla.models.rodimus import RodimusConfig, RodimusForCausalLM, RodimusModel
 from fla.models.rwkv6 import RWKV6Config, RWKV6ForCausalLM, RWKV6Model
 from fla.models.rwkv7 import RWKV7Config, RWKV7ForCausalLM, RWKV7Model
 from fla.models.samba import SambaConfig, SambaForCausalLM, SambaModel
+from fla.models.slide_window_transformer_attention_sink import (
+    SlideWindowTransformerAttentionSinkConfig,
+    SlideWindowTransformerAttentionSinkForCausalLM,
+    SlideWindowTransformerAttentionSinkModel,
+)
 from fla.models.transformer import TransformerConfig, TransformerForCausalLM, TransformerModel
 from fla.models.wall_transformer import WallTransformerConfig, WallTransformerForCausalLM, WallTransformerModel
 from fla.models.yoco import YOCOConfig, YOCOForCausalLM, YOCOModel
@@ -123,6 +129,9 @@ __all__ = [
     'MesaNetConfig',
     'MesaNetForCausalLM',
     'MesaNetModel',
+    'MesaNetDIYConfig',
+    'MesaNetDIYForCausalLM',
+    'MesaNetDIYModel',
     'MoBAConfig',
     'MoBAForCausalLM',
     'MoBAModel',
@@ -162,6 +171,9 @@ __all__ = [
     'SambaConfig',
     'SambaForCausalLM',
     'SambaModel',
+    'SlideWindowTransformerAttentionSinkConfig',
+    'SlideWindowTransformerAttentionSinkForCausalLM',
+    'SlideWindowTransformerAttentionSinkModel',
     'TransformerConfig',
     'TransformerForCausalLM',
     'TransformerModel',
