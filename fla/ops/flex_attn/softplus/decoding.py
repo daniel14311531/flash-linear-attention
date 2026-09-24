@@ -10,12 +10,13 @@ import triton
 import triton.language as tl
 
 from fla.ops.utils.cumsum import chunk_global_cumsum
-from fla.ops.utils.op import exp
+from fla.ops.utils.softplus import softplus
 from fla.utils import autotune_cache_kwargs, check_shared_mem
 
 
 @triton.heuristics({
     'USE_G': lambda args: args['g_cumsum'] is not None,
+    'USE_WEIGHT_BIAS': lambda args: args['weight_bias'] is not None,
     'USE_SINK_BIAS': lambda args: args['sink_bias'] is not None,
 })
 @triton.autotune(
@@ -24,7 +25,7 @@ from fla.utils import autotune_cache_kwargs, check_shared_mem
         for num_warps in [1, 2, 4] + ([] if check_shared_mem('hopper') else [8])
         for num_stages in [2, 3, 4, 5]
     ],
-    key=['H', 'G', 'K', 'V', 'BK', 'BV', 'USE_G', 'USE_SINK_BIAS'],
+    key=['H', 'G', 'K', 'V', 'BK', 'BV', 'USE_G', 'USE_WEIGHT_BIAS', 'USE_SINK_BIAS'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -34,6 +35,7 @@ def naive_flex_attn_decoding_kernel(
     v,
     o,
     g_cumsum,
+    weight_bias,
     sink_bias,
     scale,
     cu_seqlens,
@@ -48,6 +50,7 @@ def naive_flex_attn_decoding_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
+    USE_WEIGHT_BIAS: tl.constexpr,
     USE_SINK_BIAS: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -65,11 +68,9 @@ def naive_flex_attn_decoding_kernel(
     p_o = o + i_bh * V + o_v
 
     b_q = tl.load(p_q, mask=o_d < K, other=0.0)
-    b_q = (b_q * scale).to(b_q.dtype)
 
     b_o = tl.zeros([BV], dtype=tl.float32)
 
-    b_m = tl.full([1], float('-inf'), dtype=tl.float32)
     b_acc = tl.zeros([1], dtype=tl.float32)
 
     if USE_G:
@@ -77,6 +78,11 @@ def naive_flex_attn_decoding_kernel(
         b_gq = tl.load(p_g, mask=(T - 1) < T, other=0.0).to(tl.float32)
     else:
         b_gq = None
+
+    if USE_WEIGHT_BIAS:
+        b_weight_bias = tl.load(weight_bias + i_hq).to(tl.float32)
+    else:
+        b_weight_bias = None
 
     if USE_SINK_BIAS:
         b_sink_bias = tl.load(sink_bias + i_hq).to(tl.float32)
@@ -93,31 +99,26 @@ def naive_flex_attn_decoding_kernel(
         # [BS, BV]
         b_v = tl.load(p_v, mask=m_k[:, None] & (o_v[None, :] < V), other=0.0)
         # [BT, BS]
-        b_s = tl.sum(b_q[None, :] * b_k, 1)
-
-        b_s = tl.where(m_k, b_s, float('-inf'))
+        b_s = tl.sum(b_q[None, :] * b_k, 1).to(tl.float32) * scale
 
         if USE_G:
             p_gk = g_cumsum + bos * HQ + i_hq + o_k * HQ
             b_gk = tl.load(p_gk, mask=m_k, other=0.0).to(tl.float32)
             b_s += b_gq - b_gk
-        # [BT, BS]
-        b_m, b_mp = tl.maximum(b_m, tl.max(b_s)), b_m
-        b_r = exp(b_mp - b_m)
-        # [BT, BS]
-        b_p = exp(b_s - b_m)
+        if USE_WEIGHT_BIAS:
+            b_s += b_weight_bias
+        b_p = tl.where(m_k, softplus(b_s), 0.0)
 
         # [BT]
-        b_acc = b_acc * b_r + tl.sum(b_p, 0)
+        b_acc += tl.sum(b_p, 0)
         # [BT, BV]
-        b_o = b_o * b_r + tl.sum(b_p[:, None] * b_v, 0)
-        b_mp = b_m
+        b_o += tl.sum(b_p[:, None] * b_v, 0)
 
     if USE_SINK_BIAS:
-        # keep the sink-bias merge finite when masking leaves a row with no valid key.
-        b_m = tl.where(b_m == float('-inf'), 0., b_m)
-        b_acc += exp(b_sink_bias - b_m)
-    b_o = b_o / b_acc
+        if USE_WEIGHT_BIAS:
+            b_sink_bias += b_weight_bias
+        b_acc += softplus(b_sink_bias)
+    b_o = b_o / tl.where(b_acc > 0, b_acc, 1.0)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=o_v < V)
 
 
@@ -130,6 +131,7 @@ def flex_attn_decoding_one_step(
     cu_seqlens: torch.LongTensor = None,
     do_gate_scale: bool = False,
     *,
+    weight_bias: torch.Tensor | None = None,
     sink_bias: torch.Tensor | None = None,
 ):
     r"""
@@ -152,10 +154,13 @@ def flex_attn_decoding_one_step(
         do_gate_scale (bool):
             Whether to apply gate scale. Default: `False`. If `True`, the attention scale will also be applied
             to the gating bias term in Forgetting Transformer or PaTH-FoX.
+        weight_bias (Optional[torch.Tensor]):
+            Per-query-head bias of shape `[HQ]` added to every softplus weight logit.
         sink_bias (Optional[torch.Tensor]):
             Per-query-head attention-sink bias logits of shape `[HQ]` — one
             learnable scalar per query head, as introduced by GPT-OSS.
-            Augments the softmax denominator without contributing to the output.
+            Adds `softplus(sink_bias + weight_bias)` to the denominator without
+            contributing to the output.
 
     Returns:
         o (torch.Tensor):
@@ -170,6 +175,8 @@ def flex_attn_decoding_one_step(
         scale = K ** -0.5
     if sink_bias is not None:
         assert sink_bias.shape == (HQ,), "sink_bias must have shape [HQ]"
+    if weight_bias is not None:
+        assert weight_bias.shape == (HQ,), "weight_bias must have shape [HQ]"
 
     BK = max(triton.next_power_of_2(K), 16)
     if check_shared_mem('hopper', q.device.index):
@@ -197,6 +204,7 @@ def flex_attn_decoding_one_step(
         v=v,
         o=o,
         g_cumsum=g_cumsum,
+        weight_bias=weight_bias,
         sink_bias=sink_bias,
         scale=scale,
         cu_seqlens=cu_seqlens,
