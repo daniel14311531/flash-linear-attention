@@ -5,7 +5,10 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-from fla.ops.backends import BackendRegistry
-from fla.ops.common.backends.tilelang import TileLangBackend
+from .naive import naive_parallel_flex_attn as naive_parallel_flex_attn_softplus
+from .parallel import parallel_flex_attn as parallel_flex_attn_softplus
 
-BackendRegistry("flex_attn_silu").register(TileLangBackend())
+__all__ = [
+    'naive_parallel_flex_attn_softplus',
+    'parallel_flex_attn_softplus',
+]

@@ -20,7 +20,6 @@ def naive_parallel_flex_attn(
     *,
     g: torch.Tensor | None = None,
     sink_bias: torch.Tensor | None = None,
-    type: Literal['sigmoid', 'SiLU'] = 'sigmoid'
 ):
     """
     Reference PyTorch implementation of parallel attention that returns both output and max_logits.
