@@ -5,7 +5,6 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-from typing import Literal
 import torch
 import torch.nn.functional as F
 
@@ -18,11 +17,12 @@ def naive_parallel_flex_attn(
     window_size: int | None = None,
     causal: bool = True,
     *,
+    weight_bias: torch.Tensor | None = None,
     g: torch.Tensor | None = None,
     sink_bias: torch.Tensor | None = None,
 ):
     """
-    Reference PyTorch implementation of parallel attention that returns both output and max_logits.
+    Reference PyTorch implementation of parallel attention that returns output.
 
     Args:
         q: [B, T, HQ, D]
@@ -35,14 +35,14 @@ def naive_parallel_flex_attn(
         g: [B, T, HQ], optional per-query-head gating logits. Any scaling
             (e.g. matching `attn_decoding_one_step(do_gate_scale=True)`) should
             be applied by the caller before passing `g` in.
+        weight_bias: [HQ], optional per-query-head attention weights bias on logits
         sink_bias: [HQ], optional per-query-head attention-sink bias logits
-            (GPT-OSS style). One scalar per query head added to the softmax
+            (GPT-OSS style). One scalar per query head added to the softplus-weight
             denominator without a corresponding key/value — absorbs probability
             mass but does not contribute to the output.
 
     Returns:
         output: [B, T, HQ, D]
-        max_logits: [B, T, HQ]
     """
     B, T, HQ, D = q.shape
     H = k.shape[2]
@@ -65,32 +65,37 @@ def naive_parallel_flex_attn(
         mask = col_idx > row_idx
         if window_size is not None:
             mask = mask | (row_idx - col_idx >= window_size)
-        scores = scores.masked_fill(mask[:, None, None], float('-inf'))
+        scores = scores.to(torch.float32).masked_fill(mask[:, None, None], float('-inf'))
 
     if g is not None:
         assert g.shape == (B, T, HQ), "g must have shape [B, T, HQ]"
         g_cumsum = g.float().cumsum(1).reshape(B, T, H, G).permute(0, 2, 3, 1)
         scores = scores + (g_cumsum[..., :, None] - g_cumsum[..., None, :])
 
-    # max_logits: [B, H, G, T] -> [B, T, HQ]
-    max_logits = scores.max(dim=-1).values
     if sink_bias is not None:
         assert sink_bias.shape == (HQ,), "sink_bias must have shape [HQ]"
         sink_bias_logits = sink_bias.reshape(H, G)[None, :, :, None]
-        max_logits = torch.maximum(max_logits, sink_bias_logits)
+
+    if weight_bias is not None:
+        assert weight_bias.shape == (HQ,), "weight_bias must have shape [HQ]"
+        scores = scores + weight_bias.reshape(H, G)[None, :, :, None, None]
+        if sink_bias is not None:
+            sink_bias_logits = sink_bias_logits + weight_bias.reshape(H, G)[None, :, :, None]
 
     if sink_bias is None:
         # compute output via einsum: [B, H, G, T, T] x [B, T, H, D] -> [B, T, H, G, D]
-        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights_unnorm = F.softplus(scores)
+        denom = torch.sum(attn_weights_unnorm, dim=-1)
+        attn_weights = attn_weights_unnorm / denom[..., None]
         output = torch.einsum('bhgqk,bkhd->bqhgd', attn_weights, v).reshape(B, T, HQ, D)
     else:
-        probs_unnorm = torch.exp(scores - max_logits[..., None])
-        sink_bias_unnorm = torch.exp(sink_bias_logits - max_logits)
+        probs_unnorm = F.softplus(scores)
+        sink_bias_unnorm = F.softplus(sink_bias_logits)
         denom = probs_unnorm.sum(dim=-1) + sink_bias_unnorm
         output = torch.einsum('bhgqk,bkhd->bqhgd', probs_unnorm, v)
         output = (output / denom.permute(0, 3, 1, 2)[..., None]).reshape(B, T, HQ, D)
 
-    return output, max_logits.permute(0, 3, 1, 2).reshape(B, T, HQ)
+    return output
 
 
 def naive_flex_attn_decoding(
@@ -102,6 +107,7 @@ def naive_flex_attn_decoding(
     cu_seqlens: torch.LongTensor | None = None,
     do_gate_scale: bool = False,
     *,
+    weight_bias: torch.Tensor | None = None,
     sink_bias: torch.Tensor | None = None,
 ):
     """
@@ -118,6 +124,7 @@ def naive_flex_attn_decoding(
         cu_seqlens: [B+1]
         do_gate_scale: bool, if True scales `g` by `scale` before use
             (matches PaTH / Forgetting Transformer convention).
+        weight_bias: [HQ], optional weight bias on logits
         sink_bias: [HQ], optional GPT-OSS-style sink bias logits
 
     Returns:
@@ -132,6 +139,11 @@ def naive_flex_attn_decoding(
         scale = D ** -0.5
     if sink_bias is not None:
         assert sink_bias.shape == (HQ,), "sink_bias must have shape [HQ]"
+
+    if weight_bias is not None:
+        assert weight_bias.shape == (HQ,), "weight_bias must have shape [HQ]"
+        if sink_bias is not None:
+            sink_bias = sink_bias + weight_bias
 
     outputs = []
     for i in range(len(cu_seqlens) - 1):
@@ -149,7 +161,7 @@ def naive_flex_attn_decoding(
 
         # scores: [1, H, G, 1, T_i]
         qi_g = qi.reshape(1, 1, H, G, D)
-        scores = torch.einsum('bqhgd,bkhd->bhgqk', qi_g, ki) * scale
+        scores = torch.einsum('bqhgd,bkhd->bhgqk', qi_g, ki).to(torch.float32) * scale
 
         if g is not None:
             gi = g[:, bos:eos].float()
@@ -160,14 +172,18 @@ def naive_flex_attn_decoding(
             g_q = gi_cumsum[..., -1:].unsqueeze(-1)  # [1, H, G, 1, 1]
             scores = scores + (g_q - gi_cumsum[..., None, :])
 
+        if weight_bias is not None:
+            scores = scores + weight_bias.reshape(H, G)[None, :, :, None, None]
+
         if sink_bias is None:
-            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights_unnorm = F.softplus(scores)
+            denom = torch.sum(attn_weights_unnorm, dim=-1)
+            attn_weights = attn_weights_unnorm / denom[..., None]
             oi = torch.einsum('bhgqk,bkhd->bqhgd', attn_weights, vi).reshape(1, 1, HQ, V)
         else:
             sink_bias_logits = sink_bias.reshape(H, G)[None, :, :, None]  # [1, H, G, 1]
-            max_logits = torch.maximum(scores.max(dim=-1).values, sink_bias_logits)  # [1, H, G, 1]
-            probs_unnorm = torch.exp(scores - max_logits[..., None])
-            sink_bias_unnorm = torch.exp(sink_bias_logits - max_logits)
+            probs_unnorm = F.softplus(scores)
+            sink_bias_unnorm = F.softplus(sink_bias_logits)
             denom = probs_unnorm.sum(dim=-1) + sink_bias_unnorm  # [1, H, G, 1]
             oi_pack = torch.einsum('bhgqk,bkhd->bqhgd', probs_unnorm, vi)
             oi = (oi_pack / denom.permute(0, 3, 1, 2)[..., None]).reshape(1, 1, HQ, V)
