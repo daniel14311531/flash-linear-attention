@@ -23,7 +23,7 @@ def naive_parallel_flex_attn(
     sink_bias: torch.Tensor | None = None,
 ):
     """
-    Reference PyTorch implementation of parallel attention that returns both output and max_logits.
+    Reference PyTorch implementation of parallel attention that returns both output.
 
     Args:
         q: [B, T, HQ, D]
@@ -44,7 +44,6 @@ def naive_parallel_flex_attn(
 
     Returns:
         output: [B, T, HQ, D]
-        max_logits: [B, T, HQ]
     """
     B, T, HQ, D = q.shape
     H = k.shape[2]

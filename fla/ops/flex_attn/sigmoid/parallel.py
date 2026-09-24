@@ -10,16 +10,14 @@ import triton
 import triton.language as tl
 from einops import reduce
 
-from fla.ops.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices
-from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.cumsum import chunk_global_cumsum
-from fla.ops.utils.op import exp2, log2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, check_shared_mem, contiguous
 
 
 @triton.heuristics({
     'USE_G': lambda args: args['g_cumsum'] is not None,
+    'USE_WEIGHT_BIAS': lambda args: args['weight_bias'] is not None,
     'USE_SINK_BIAS': lambda args: args['sink_bias'] is not None,
     'USE_WINDOW': lambda args: args['W'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -31,8 +29,9 @@ def parallel_flex_attn_fwd_kernel(
     v,
     o,
     g_cumsum,
+    weight_bias,
     sink_bias,
-    lse,
+    normalizer,
     scale,
     cu_seqlens,
     chunk_indices,
@@ -49,6 +48,7 @@ def parallel_flex_attn_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
+    USE_WEIGHT_BIAS: tl.constexpr,
     USE_SINK_BIAS: tl.constexpr,
     USE_WINDOW: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -64,8 +64,6 @@ def parallel_flex_attn_fwd_kernel(
     else:
         i_n = i_b
         bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
-    RCP_LN2: tl.constexpr = 1.4426950216
-
     # [BT]
     o_q = i_t * BT + tl.arange(0, BT)
     o_d = tl.arange(0, BK)
@@ -73,7 +71,7 @@ def parallel_flex_attn_fwd_kernel(
     m_q = o_q < T
     p_q = q + (bos * HQ + i_hq) * K + o_q[:, None] * (HQ*K) + o_d[None, :]
     p_o = o + (bos * HQ + i_hq) * V + o_q[:, None] * (HQ*V) + o_v[None, :]
-    p_lse = lse + bos * HQ + i_hq + o_q * HQ
+    p_normalizer = normalizer + bos * HQ + i_hq + o_q * HQ
 
     # the Q block is kept in the shared memory throughout the whole kernel
     # [BT, BK]
@@ -81,7 +79,6 @@ def parallel_flex_attn_fwd_kernel(
     # [BT, BV]
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
 
-    b_m = tl.full([BT], float('-inf'), dtype=tl.float32)
     b_acc = tl.zeros([BT], dtype=tl.float32)
 
     if USE_G:
@@ -89,6 +86,11 @@ def parallel_flex_attn_fwd_kernel(
         b_gq = tl.load(p_g, mask=m_q, other=0.0).to(tl.float32)
     else:
         b_gq = None
+
+    if USE_WEIGHT_BIAS:
+        b_weight_bias = tl.load(weight_bias + i_hq).to(tl.float32)
+    else:
+        b_weight_bias = None
 
     if USE_SINK_BIAS:
         b_sink_bias = tl.load(sink_bias + i_hq).to(tl.float32)
@@ -109,28 +111,22 @@ def parallel_flex_attn_fwd_kernel(
         # [BS, BV]
         b_v = tl.load(p_v, mask=m_k[:, None] & (o_v[None, :] < V), other=0.0)
         # [BT, BS]
-        b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+        b_s = tl.dot(b_q, b_k) * scale
 
         if USE_G:
             b_gk = tl.load(g_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
             b_s += b_gq[:, None] - b_gk[None, :]
+        if USE_WEIGHT_BIAS:
+            b_s += b_weight_bias
 
         if USE_WINDOW:
             b_s = tl.where((o_q[:, None] - o_k[None, :] < W) & m_k[None, :], b_s, float('-inf'))
 
-        # [BT, BS]
-        b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
-        # keep the online softmax pivot finite for rows that still have no valid key.
-        # this matches sglang's masked-row stabilization and avoids -inf - (-inf) = NaN.
-        b_mw = tl.where(b_m == float('-inf'), 0., b_m)
-        b_r = exp2(b_mp - b_mw)
-        b_p = exp2(b_s - b_mw[:, None])
+        b_p = tl.sigmoid(b_s)
         # [BT]
-        b_acc = b_acc * b_r + tl.sum(b_p, 1)
+        b_acc += tl.sum(b_p, 1)
         # [BT, BV]
-        b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
-
-        b_mp = b_m
+        b_o += tl.dot(b_p.to(b_q.dtype), b_v)
 
     for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
         # [BS]
@@ -144,43 +140,34 @@ def parallel_flex_attn_fwd_kernel(
         # [BS, BV]
         b_v = tl.load(p_v, mask=m_k[:, None] & (o_v[None, :] < V), other=0.0)
         # [BT, BS]
-        b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+        b_s = tl.dot(b_q, b_k) * scale
 
         if USE_G:
             b_gk = tl.load(g_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
             b_s += b_gq[:, None] - b_gk[None, :]
+        if USE_WEIGHT_BIAS:
+            b_s += b_weight_bias
 
         m_s = (o_q[:, None] >= o_k[None, :]) & m_k[None, :]
         if USE_WINDOW:
             m_s = m_s & (o_q[:, None] - o_k[None, :] < W)
         b_s = tl.where(m_s, b_s, float('-inf'))
 
+        b_p = tl.sigmoid(b_s)
         # [BT]
-        b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
-        b_mw = tl.where(b_m == float('-inf'), 0., b_m)
-        b_r = exp2(b_mp - b_mw)
-        b_p = exp2(b_s - b_mw[:, None])
-        # [BT]
-        b_acc = b_acc * b_r + tl.sum(b_p, 1)
+        b_acc += tl.sum(b_p, 1)
         # [BT, BV]
-        b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
-        b_mp = b_m
+        b_o += tl.dot(b_p.to(b_q.dtype), b_v)
 
     if USE_SINK_BIAS:
-        # when a row has no valid key at all, b_m is still -inf here.
-        # use a finite pivot before merging the sink-bias mass so lse becomes
-        # the sink-bias logit instead of hitting the -inf + inf = NaN path.
-        b_m = tl.where(b_m == float('-inf'), 0., b_m)
-        # denominator-only sink-bias update (matches GPT-OSS / sglang):
-        # the bias logit augments the softmax normalizer without contributing
-        # to the value matmul.
-        b_acc += exp2(b_sink_bias - b_m)
+        if USE_WEIGHT_BIAS:
+            b_sink_bias += b_weight_bias
+        b_acc += tl.sigmoid(b_sink_bias)
 
     b_o = b_o / b_acc[:, None]
-    b_m += log2(b_acc)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_q[:, None] & (o_v[None, :] < V))
     if i_v == 0:
-        tl.store(p_lse, b_m.to(p_lse.dtype.element_ty), mask=m_q)
+        tl.store(p_normalizer, b_acc.to(p_normalizer.dtype.element_ty), mask=m_q)
 
 
 @triton.jit
@@ -204,6 +191,7 @@ def parallel_flex_attn_bwd_kernel_preprocess(
 
 @triton.heuristics({
     'USE_G': lambda args: args['g_cumsum'] is not None,
+    'USE_WEIGHT_BIAS': lambda args: args['weight_bias'] is not None,
     'USE_WINDOW': lambda args: args['W'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -212,12 +200,14 @@ def parallel_flex_attn_bwd_kernel_dq(
     q,
     k,
     v,
-    lse,
+    normalizer,
     delta,
     do,
     dq,
     dg_cumsum,
+    dweight_bias_rows,
     g_cumsum,
+    weight_bias,
     scale,
     cu_seqlens,
     chunk_indices,
@@ -234,6 +224,7 @@ def parallel_flex_attn_bwd_kernel_dq(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
+    USE_WEIGHT_BIAS: tl.constexpr,
     USE_WINDOW: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
@@ -248,9 +239,6 @@ def parallel_flex_attn_bwd_kernel_dq(
     else:
         i_n = i_b
         bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
-    # NOTE: we must multiply RCP_LN2 after tl.dot for high precision
-    RCP_LN2: tl.constexpr = 1.4426950216
-
     o_q = i_t * BT + tl.arange(0, BT)
     o_d = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
@@ -258,7 +246,7 @@ def parallel_flex_attn_bwd_kernel_dq(
     p_q = q + (bos * HQ + i_hq) * K + o_q[:, None] * (HQ*K) + o_d[None, :]
     p_dq = dq + (bos * HQ + i_hq) * K + o_q[:, None] * (HQ*K) + o_d[None, :]
     p_do = do + (bos * HQ + i_hq) * V + o_q[:, None] * (HQ*V) + o_v[None, :]
-    p_lse = lse + bos * HQ + i_hq + o_q * HQ
+    p_normalizer = normalizer + bos * HQ + i_hq + o_q * HQ
     p_delta = delta + bos * HQ + i_hq + o_q * HQ
 
     # [BT, BK]
@@ -266,7 +254,7 @@ def parallel_flex_attn_bwd_kernel_dq(
     # [BT, BV]
     b_do = tl.load(p_do, mask=m_q[:, None] & (o_v[None, :] < V), other=0.0)
     # [BT]
-    b_lse = tl.load(p_lse, mask=m_q, other=0.0)
+    b_normalizer = tl.load(p_normalizer, mask=m_q, other=1.0)
     b_delta = tl.load(p_delta, mask=m_q, other=0.0)
 
     # [BT, BK]
@@ -278,6 +266,12 @@ def parallel_flex_attn_bwd_kernel_dq(
     else:
         b_gq = None
         b_dg = None
+    if USE_WEIGHT_BIAS:
+        b_weight_bias = tl.load(weight_bias + i_hq).to(tl.float32)
+        b_dweight_bias = tl.zeros([BT], dtype=tl.float32)
+    else:
+        b_weight_bias = None
+        b_dweight_bias = None
 
     i_start = tl.maximum((i_t * BT - W + 1) // BS * BS, 0) if USE_WINDOW else 0
 
@@ -292,21 +286,26 @@ def parallel_flex_attn_bwd_kernel_dq(
         # [BV, BS]
         b_v = tl.load(p_v, mask=(o_v[:, None] < V) & m_k[None, :], other=0.0)
         # [BT, BS]
-        b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+        b_s = tl.dot(b_q, b_k) * scale
         if USE_G:
             b_gk = tl.load(g_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
             b_s += b_gq[:, None] - b_gk[None, :]
+        if USE_WEIGHT_BIAS:
+            b_s += b_weight_bias
 
         if USE_WINDOW:
             b_s = tl.where((o_q[:, None] - o_k[None, :] < W) & m_k[None, :], b_s, float('-inf'))
-        b_p = exp2(b_s - b_lse[:, None])
+        b_w = tl.sigmoid(b_s)
+        b_p = b_w / b_normalizer[:, None]
         # [BT, BV] @ [BV, BS] -> [BT, BS]
         b_dp = tl.dot(b_do, b_v)
-        b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
+        b_ds = b_p * (1.0 - b_w) * (b_dp.to(tl.float32) - b_delta[:, None])
         # [BT, BS] @ [BS, BK] -> [BT, BK]
         b_dq = tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k), b_dq)
         if USE_G:
             b_dg += tl.sum(b_ds, 1)
+        if USE_WEIGHT_BIAS:
+            b_dweight_bias += tl.sum(b_ds, 1)
 
     for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
         # [BS]
@@ -320,37 +319,43 @@ def parallel_flex_attn_bwd_kernel_dq(
         # [BV, BS]
         b_v = tl.load(p_v, mask=(o_v[:, None] < V) & m_k[None, :], other=0.0)
         # [BT, BS]
-        b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+        b_s = tl.dot(b_q, b_k) * scale
 
         if USE_G:
             p_gk = g_cumsum + bos * HQ + i_hq + o_k * HQ
             b_gk = tl.load(p_gk, mask=m_k, other=0.0).to(tl.float32)
             b_s += b_gq[:, None] - b_gk[None, :]
+        if USE_WEIGHT_BIAS:
+            b_s += b_weight_bias
+        m_s = (o_q[:, None] >= o_k[None, :]) & m_k[None, :]
         if USE_WINDOW:
-            b_p = tl.where(
-                (o_q[:, None] >= o_k[None, :]) & (o_q[:, None] - o_k[None, :] < W) & m_k[None, :],
-                exp2(b_s - b_lse[:, None]), 0
-            )
-        else:
-            b_p = tl.where((o_q[:, None] >= o_k[None, :]) & m_k[None, :], exp2(b_s - b_lse[:, None]), 0)
+            m_s = m_s & (o_q[:, None] - o_k[None, :] < W)
+        b_w = tl.where(m_s, tl.sigmoid(b_s), 0.0)
+        b_p = b_w / b_normalizer[:, None]
 
         # [BT, BV] @ [BV, BS] -> [BT, BS]
         b_dp = tl.dot(b_do, b_v)
-        b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
+        b_ds = b_p * (1.0 - b_w) * (b_dp.to(tl.float32) - b_delta[:, None])
         # [BT, BS] @ [BS, BK] -> [BT, BK]
         b_dq = tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k), b_dq)
         if USE_G:
             b_dg += tl.sum(b_ds, 1)
+        if USE_WEIGHT_BIAS:
+            b_dweight_bias += tl.sum(b_ds, 1)
 
     b_dq *= scale
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), mask=m_q[:, None] & (o_d[None, :] < K))
     if USE_G:
         p_dg = dg_cumsum + bos * HQ + i_hq + o_q * HQ
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), mask=m_q)
+    if USE_WEIGHT_BIAS:
+        p_dweight_bias = dweight_bias_rows + bos * HQ + i_hq + o_q * HQ
+        tl.store(p_dweight_bias, b_dweight_bias, mask=m_q)
 
 
 @triton.heuristics({
     'USE_G': lambda args: args['g_cumsum'] is not None,
+    'USE_WEIGHT_BIAS': lambda args: args['weight_bias'] is not None,
     'USE_WINDOW': lambda args: args['W'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -360,7 +365,8 @@ def parallel_flex_attn_bwd_kernel_dkv(
     k,
     v,
     g_cumsum,
-    lse,
+    weight_bias,
+    normalizer,
     delta,
     do,
     dk,
@@ -382,6 +388,7 @@ def parallel_flex_attn_bwd_kernel_dkv(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
+    USE_WEIGHT_BIAS: tl.constexpr,
     USE_WINDOW: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
@@ -396,8 +403,6 @@ def parallel_flex_attn_bwd_kernel_dkv(
     else:
         i_n = i_b
         bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
-    RCP_LN2: tl.constexpr = 1.4426950216
-
     o_k = i_t * BT + tl.arange(0, BT)
     o_d = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
@@ -421,6 +426,10 @@ def parallel_flex_attn_bwd_kernel_dkv(
     else:
         b_gk = None
         b_dg = None
+    if USE_WEIGHT_BIAS:
+        b_weight_bias = tl.load(weight_bias + i_hq).to(tl.float32)
+    else:
+        b_weight_bias = None
 
     for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
         # [BS]
@@ -428,7 +437,7 @@ def parallel_flex_attn_bwd_kernel_dkv(
         m_q = o_q < T
         p_q = q + (bos * HQ + i_hq) * K + o_q[:, None] * (HQ*K) + o_d[None, :]
         p_do = do + (bos * HQ + i_hq) * V + o_q[:, None] * (HQ*V) + o_v[None, :]
-        p_lse = lse + bos * HQ + i_hq + o_q * HQ
+        p_normalizer = normalizer + bos * HQ + i_hq + o_q * HQ
         p_delta = delta + bos * HQ + i_hq + o_q * HQ
 
         # [BS, BK]
@@ -436,27 +445,27 @@ def parallel_flex_attn_bwd_kernel_dkv(
         # [BS, BV]
         b_do = tl.load(p_do, mask=m_q[:, None] & (o_v[None, :] < V), other=0.0)
         # [BS]
-        b_lse = tl.load(p_lse, mask=m_q, other=0.0)
+        b_normalizer = tl.load(p_normalizer, mask=m_q, other=1.0)
         b_delta = tl.load(p_delta, mask=m_q, other=0.0)
         # [BT, BS]
-        b_s = tl.dot(b_k, tl.trans(b_q)) * scale * RCP_LN2
+        b_s = tl.dot(b_k, tl.trans(b_q)) * scale
         if USE_G:
             p_gq = g_cumsum + bos * HQ + i_hq + o_q * HQ
             b_gq = tl.load(p_gq, mask=m_q, other=0.0).to(tl.float32)
             b_s += b_gq[None, :] - b_gk[:, None]
+        if USE_WEIGHT_BIAS:
+            b_s += b_weight_bias
+        m_s = (o_k[:, None] <= o_q[None, :]) & m_q[None, :]
         if USE_WINDOW:
-            b_p = tl.where(
-                (o_k[:, None] <= o_q[None, :]) & (o_q[None, :] - o_k[:, None] < W) & m_q[None, :],
-                exp2(b_s - b_lse[None, :]), 0
-            )
-        else:
-            b_p = tl.where((o_k[:, None] <= o_q[None, :]) & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+            m_s = m_s & (o_q[None, :] - o_k[:, None] < W)
+        b_w = tl.where(m_s, tl.sigmoid(b_s), 0.0)
+        b_p = b_w / b_normalizer[None, :]
         # [BT, BS] @ [BS, BV] -> [BT, BV]
         b_dv = tl.dot(b_p.to(b_do.dtype), b_do, b_dv)
         # [BT, BV] @ [BV, BS] -> [BT, BS]
         b_dp = tl.dot(b_v, tl.trans(b_do))
         # [BT, BS]
-        b_ds = b_p * (b_dp - b_delta[None, :])
+        b_ds = b_p * (1.0 - b_w) * (b_dp - b_delta[None, :])
         # [BT, BS] @ [BS, BK] -> [BT, BK]
         b_dk = tl.dot(b_ds.to(b_q.dtype), b_q, b_dk)
         if USE_G:
@@ -473,7 +482,7 @@ def parallel_flex_attn_bwd_kernel_dkv(
         m_q = o_q < T
         p_q = q + (bos * HQ + i_hq) * K + o_q[:, None] * (HQ*K) + o_d[None, :]
         p_do = do + (bos * HQ + i_hq) * V + o_q[:, None] * (HQ*V) + o_v[None, :]
-        p_lse = lse + bos * HQ + i_hq + o_q * HQ
+        p_normalizer = normalizer + bos * HQ + i_hq + o_q * HQ
         p_delta = delta + bos * HQ + i_hq + o_q * HQ
 
         # [BS, BK]
@@ -481,24 +490,28 @@ def parallel_flex_attn_bwd_kernel_dkv(
         # [BS, BV]
         b_do = tl.load(p_do, mask=m_q[:, None] & (o_v[None, :] < V), other=0.0)
         # [BS]
-        b_lse = tl.load(p_lse, mask=m_q, other=0.0)
+        b_normalizer = tl.load(p_normalizer, mask=m_q, other=1.0)
         b_delta = tl.load(p_delta, mask=m_q, other=0.0)
         # [BT, BS]
-        b_s = tl.dot(b_k, tl.trans(b_q)) * scale * RCP_LN2
+        b_s = tl.dot(b_k, tl.trans(b_q)) * scale
         if USE_G:
             p_gq = g_cumsum + bos * HQ + i_hq + o_q * HQ
             b_gq = tl.load(p_gq, mask=m_q, other=0.0).to(tl.float32)
             b_s += b_gq[None, :] - b_gk[:, None]
+        if USE_WEIGHT_BIAS:
+            b_s += b_weight_bias
         if USE_WINDOW:
-            b_p = tl.where((o_q[None, :] - o_k[:, None] < W) & m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+            m_s = (o_q[None, :] - o_k[:, None] < W) & m_q[None, :]
         else:
-            b_p = tl.where(m_q[None, :], exp2(b_s - b_lse[None, :]), 0)
+            m_s = m_q[None, :]
+        b_w = tl.where(m_s, tl.sigmoid(b_s), 0.0)
+        b_p = b_w / b_normalizer[None, :]
         # [BT, BS] @ [BS, BV] -> [BT, BV]
         b_dv = tl.dot(b_p.to(b_do.dtype), b_do, b_dv)
         # [BT, BV] @ [BV, BS] -> [BT, BS]
         b_dp = tl.dot(b_v, tl.trans(b_do))
         # [BT, BS]
-        b_ds = b_p * (b_dp - b_delta[None, :])
+        b_ds = b_p * (1.0 - b_w) * (b_dp - b_delta[None, :])
         # [BT, BS] @ [BS, BK] -> [BT, BK]
         b_dk = tl.dot(b_ds.to(b_q.dtype), b_q, b_dk)
         if USE_G:
@@ -512,12 +525,12 @@ def parallel_flex_attn_bwd_kernel_dkv(
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), mask=m_k)
 
 
-@dispatch('flex_attn_sigmoid')
 def parallel_flex_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g_cumsum: torch.Tensor,
+    g_cumsum: torch.Tensor | None,
+    weight_bias: torch.Tensor | None,
     sink_bias: torch.Tensor | None,
     scale: float,
     window_size: int | None = None,
@@ -552,7 +565,7 @@ def parallel_flex_attn_fwd(
     assert NK == 1, "The key dimension can not be larger than 256"
 
     o = torch.empty(B, T, HQ, V, dtype=v.dtype, device=q.device)
-    lse = torch.empty(B, T, HQ, dtype=torch.float, device=q.device)
+    normalizer = torch.empty(B, T, HQ, dtype=torch.float, device=q.device)
     grid = (NV, NT, B * HQ)
     parallel_flex_attn_fwd_kernel[grid](
         q=q,
@@ -560,8 +573,9 @@ def parallel_flex_attn_fwd(
         v=v,
         o=o,
         g_cumsum=g_cumsum,
+        weight_bias=weight_bias,
         sink_bias=sink_bias,
-        lse=lse,
+        normalizer=normalizer,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -579,7 +593,7 @@ def parallel_flex_attn_fwd(
         BV=BV,
         num_warps=num_warps,
     )
-    return o, lse
+    return o, normalizer
 
 
 def parallel_flex_attn_bwd_preprocess(
@@ -598,14 +612,14 @@ def parallel_flex_attn_bwd_preprocess(
     return delta
 
 
-@dispatch('flex_attn_sigmoid')
 def parallel_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor,
-    g_cumsum: torch.Tensor,
-    lse: torch.Tensor,
+    g_cumsum: torch.Tensor | None,
+    weight_bias: torch.Tensor | None,
+    normalizer: torch.Tensor,
     do: torch.Tensor,
     sink_bias: torch.Tensor | None = None,
     scale: float = None,
@@ -654,17 +668,23 @@ def parallel_attn_bwd(
     if g_cumsum is not None:
         dg_cumsum = torch.empty(B, T, HQ, dtype=torch.float, device=q.device)
         dg_cumsum_k = torch.empty(B, T, HQ, dtype=torch.float, device=q.device)
+    dweight_bias_rows = (
+        torch.empty(B, T, HQ, dtype=torch.float, device=q.device)
+        if weight_bias is not None else None
+    )
 
     parallel_flex_attn_bwd_kernel_dq[grid](
         q=q,
         k=k,
         v=v,
         g_cumsum=g_cumsum,
-        lse=lse,
+        weight_bias=weight_bias,
+        normalizer=normalizer,
         delta=delta,
         do=do,
         dq=dq,
         dg_cumsum=dg_cumsum,
+        dweight_bias_rows=dweight_bias_rows,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
@@ -687,7 +707,8 @@ def parallel_attn_bwd(
         k=k,
         v=v,
         g_cumsum=g_cumsum,
-        lse=lse,
+        weight_bias=weight_bias,
+        normalizer=normalizer,
         delta=delta,
         do=do,
         dk=dk,
@@ -715,12 +736,17 @@ def parallel_attn_bwd(
     if g_cumsum is not None:
         dg_cumsum.add_(dg_cumsum_k)
 
+    dweight_bias = dweight_bias_rows.sum((0, 1)) if weight_bias is not None else None
     dsink_bias = None
     if sink_bias is not None:
-        p_sink_bias = torch.exp2(sink_bias[None, None, :] - lse)
-        dsink_bias = -(p_sink_bias * delta).sum((0, 1))
+        sink_logits = sink_bias + weight_bias if weight_bias is not None else sink_bias
+        sink_weight = torch.sigmoid(sink_logits)
+        p_sink = sink_weight[None, None, :] / normalizer
+        dsink_bias = -(p_sink * (1.0 - sink_weight[None, None, :]) * delta).sum((0, 1))
+        if dweight_bias is not None:
+            dweight_bias = dweight_bias + dsink_bias
 
-    return dq, dk, dv, dg_cumsum, dsink_bias
+    return dq, dk, dv, dg_cumsum, dweight_bias, dsink_bias
 
 
 class ParallelAttentionFunction(torch.autograd.Function):
@@ -728,23 +754,23 @@ class ParallelAttentionFunction(torch.autograd.Function):
     @staticmethod
     @contiguous
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, g, sink_bias, scale, window_size, cu_seqlens, chunk_indices=None):
+    def forward(ctx, q, k, v, g, weight_bias, sink_bias, scale, window_size, cu_seqlens, chunk_indices=None):
         ctx.dtype = q.dtype
 
-        g_cumsum = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2) if g is not None else None
-        sink_bias = sink_bias * RCP_LN2 if sink_bias is not None else None
-        o, lse = parallel_flex_attn_fwd(
+        g_cumsum = chunk_global_cumsum(g, cu_seqlens=cu_seqlens) if g is not None else None
+        o, normalizer = parallel_flex_attn_fwd(
             q=q,
             k=k,
             v=v,
             g_cumsum=g_cumsum,
+            weight_bias=weight_bias,
             sink_bias=sink_bias,
             scale=scale,
             window_size=window_size,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
-        ctx.save_for_backward(q, k, v, o, g_cumsum, lse, sink_bias)
+        ctx.save_for_backward(q, k, v, o, g_cumsum, weight_bias, sink_bias, normalizer)
         ctx.scale = scale
         ctx.window_size = window_size
         ctx.cu_seqlens = cu_seqlens
@@ -754,14 +780,15 @@ class ParallelAttentionFunction(torch.autograd.Function):
     @contiguous
     @autocast_custom_bwd
     def backward(ctx, do):
-        q, k, v, o, g_cumsum, lse, sink_bias = ctx.saved_tensors
-        dq, dk, dv, dg, dsink_bias = parallel_attn_bwd(
+        q, k, v, o, g_cumsum, weight_bias, sink_bias, normalizer = ctx.saved_tensors
+        dq, dk, dv, dg, dweight_bias, dsink_bias = parallel_attn_bwd(
             q=q,
             k=k,
             v=v,
             o=o,
             g_cumsum=g_cumsum,
-            lse=lse,
+            weight_bias=weight_bias,
+            normalizer=normalizer,
             do=do,
             sink_bias=sink_bias,
             scale=ctx.scale,
@@ -771,7 +798,7 @@ class ParallelAttentionFunction(torch.autograd.Function):
         if dg is not None:
             dg = chunk_global_cumsum(dg, cu_seqlens=ctx.cu_seqlens, reverse=True)
 
-        return dq.to(q), dk.to(k), dv.to(v), dg, dsink_bias, None, None, None, None
+        return dq.to(q), dk.to(k), dv.to(v), dg, dweight_bias, dsink_bias, None, None, None, None
 
 
 def parallel_flex_attn(
@@ -784,6 +811,7 @@ def parallel_flex_attn(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
     *,
+    weight_bias: torch.Tensor | None = None,
     sink_bias: torch.Tensor | None = None,
     **kwargs
 ) -> torch.Tensor:
@@ -808,16 +836,19 @@ def parallel_flex_attn(
         cu_seqlens (torch.LongTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
+        weight_bias (Optional[torch.Tensor]):
+            Per-query-head bias of shape `[HQ]` added to every sigmoid weight logit.
         sink_bias (Optional[torch.Tensor]):
             Per-query-head attention-sink bias logits of shape `[HQ]` — one
             learnable scalar per query head, as introduced by GPT-OSS.
 
-            Augments the softmax denominator with `exp(sink_bias[h])` without
+            Augments the sigmoid-weight denominator with
+            `sigmoid(sink_bias[h] + weight_bias[h])` without
             adding a corresponding key/value entry, so the model can route
             attention mass to a learnable "no-op" target:
-                p_i    = exp(s_i)          / (sum_j exp(s_j) + exp(sink_bias[h]))
+                p_i    = sigmoid(s_i + weight_bias[h]) / normalizer
                 o      = sum_i p_i * v_i   # sink slot contributes no value
-            When `None`, standard softmax is used. Reserved name: the future
+            Reserved name: the future
             `sink_tokens_*` kwargs will support Xiao 2024-style K/V sink tokens
             and may be combined with `sink_bias`.
 
@@ -838,8 +869,10 @@ def parallel_flex_attn(
         )
     if sink_bias is not None:
         assert sink_bias.shape == (q.shape[2],), "sink_bias must have shape [HQ]"
+    if weight_bias is not None:
+        assert weight_bias.shape == (q.shape[2],), "weight_bias must have shape [HQ]"
 
     o = ParallelAttentionFunction.apply(
-        q, k, v, g, sink_bias, scale, window_size, cu_seqlens, chunk_indices
+        q, k, v, g, weight_bias, sink_bias, scale, window_size, cu_seqlens, chunk_indices
     )
     return o
