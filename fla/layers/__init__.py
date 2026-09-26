@@ -45,6 +45,8 @@ from .rebased import ReBasedLinearAttention
 from .rodimus import RodimusAttention, SlidingWindowSharedKeyAttention
 from .rwkv6 import RWKV6Attention
 from .rwkv7 import RWKV7Attention
+from .sigmoid import SigmoidAttention
+from .softplus import SoftplusAttention
 from .wall_attn import WallAttention
 from .yoco import YOCOCrossAttention, YOCOGatedRetention, YOCOSharedKVBuilder
 
@@ -89,7 +91,9 @@ __all__ = [
     'Raven',
     'ReBasedLinearAttention',
     'RodimusAttention',
+    'SigmoidAttention',
     'SlidingWindowSharedKeyAttention',
+    'SoftplusAttention',
     'WallAttention',
     'YOCOCrossAttention',
     'YOCOGatedRetention',

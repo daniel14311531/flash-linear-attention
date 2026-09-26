@@ -40,14 +40,9 @@ logger = logging.get_logger(__name__)
 
 class TransformerBlock(GradientCheckpointingLayer):
 
-    def __init__(self, config: TransformerConfig, layer_idx: int):
-        super().__init__()
-
-        self.config = config
-        self.layer_idx = layer_idx
-
-        self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
-        self.attn = Attention(
+    @staticmethod
+    def _build_attention(config: TransformerConfig, layer_idx: int) -> nn.Module:
+        return Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
             num_kv_heads=config.num_kv_heads,
@@ -58,6 +53,15 @@ class TransformerBlock(GradientCheckpointingLayer):
             max_position_embeddings=config.max_position_embeddings,
             layer_idx=layer_idx,
         )
+
+    def __init__(self, config: TransformerConfig, layer_idx: int):
+        super().__init__()
+
+        self.config = config
+        self.layer_idx = layer_idx
+
+        self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
+        self.attn = self._build_attention(config, layer_idx)
 
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = TransformerMLP(
@@ -226,13 +230,15 @@ class TransformerPreTrainedModel(PreTrainedModel):
 
 class TransformerModel(TransformerPreTrainedModel):
 
+    _block_class = TransformerBlock
+
     def __init__(self, config: TransformerConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([self._block_class(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
 
         self.use_attnres = config.attnres_block_size is not None
@@ -346,10 +352,11 @@ class TransformerModel(TransformerPreTrainedModel):
 class TransformerForCausalLM(TransformerPreTrainedModel, FLAGenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
+    _model_class = TransformerModel
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = TransformerModel(config)
+        self.model = self._model_class(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.criterion = None
